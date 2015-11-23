@@ -17,13 +17,13 @@ Example for Maven:
 <dependency>
     <groupId>com.thinkaurelius.thrift</groupId>
     <artifactId>thrift-server</artifactId>
-    <version>0.3.0</version>
+    <version>0.3.8</version>
 </dependency>
 ```
 and for Ivy:
 
 ```xml
-<dependency org="com.thinkaurelius.thrift" name="thrift-server" rev="0.3.5" />
+<dependency org="com.thinkaurelius.thrift" name="thrift-server" rev="0.3.8" />
 ```
 
 ## Performance numbers
