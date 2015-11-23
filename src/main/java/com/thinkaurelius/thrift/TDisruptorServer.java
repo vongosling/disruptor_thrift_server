@@ -19,6 +19,7 @@
 package com.thinkaurelius.thrift;
 
 import javax.management.*;
+import java.io.Closeable;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.channels.CancelledKeyException;
@@ -26,9 +27,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.spi.SelectorProvider;
 import java.util.Iterator;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,7 +69,8 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
     public static class Args extends AbstractNonblockingServer.AbstractNonblockingServerArgs<Args>
     {
         private Integer numAcceptors, numSelectors, numWorkersPerSelector, ringSize, maxFrameSizeInBytes = 16384000;
-        private boolean useHeapBasedAllocation;
+        private boolean useHeapBasedAllocation = true, alwaysReallocateBuffers = true;
+        private ThreadPoolExecutor invocationExecutor;
 
         public Args(TNonblockingServerTransport transport)
         {
@@ -118,15 +118,35 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             this.maxFrameSizeInBytes = maxFrameSizeInBytes;
             return this;
         }
+
+        @SuppressWarnings("unused")
+        public Args alwaysReallocateBuffers(boolean flag) {
+            this.alwaysReallocateBuffers = flag;
+            return this;
+        }
+
+        /**
+         * Executor if set takes precedence over numWorkersPerSelector.
+         *
+         * @param executor The executor to use for message execution.
+         *
+         * @return self.
+         */
+        @SuppressWarnings("unused")
+        public Args invocationExecutor(ThreadPoolExecutor executor) {
+            this.invocationExecutor = executor;
+            return this;
+        }
     }
 
     private final AcceptorThread[] acceptorThreads;
     private final SelectorThread[] selectorThreads;
     private final SelectorLoadBalancer selectorLoadBalancer;
+    private final ThreadPoolExecutor globalInvoker;
 
     private final ThriftFactories thriftFactories;
 
-    private volatile boolean useHeapBasedAllocation, isStopped;
+    private volatile boolean useHeapBasedAllocation, alwaysReallocateBuffers, isStopped;
 
     public TDisruptorServer(Args args)
     {
@@ -166,6 +186,7 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
         }
 
         useHeapBasedAllocation = args.useHeapBasedAllocation;
+        alwaysReallocateBuffers = args.alwaysReallocateBuffers;
 
         thriftFactories = new ThriftFactories(inputTransportFactory_, outputTransportFactory_,
                                               inputProtocolFactory_,  outputProtocolFactory_,
@@ -184,12 +205,32 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             throw new RuntimeException("Could not create acceptor threads", e);
         }
 
+        if (args.invocationExecutor != null)
+            logger.info(String.format("Going to use %s for all of the Selector threads..", args.invocationExecutor));
+
         try
         {
             selectorThreads = new SelectorThread[numSelectors];
 
+            globalInvoker = (args.invocationExecutor != null) ? args.invocationExecutor : null;
+            int numHandlers = (globalInvoker != null)
+                                ? globalInvoker.getMaximumPoolSize() / numSelectors
+                                : numWorkersPerSelector;
+
             for (int i = 0; i < numSelectors; i++)
-                selectorThreads[i] = new SelectorThread("Thrift-Selector_" + i, nextPowerOfTwo(ringSize), numWorkersPerSelector);
+            {
+                ThreadPoolExecutor invoker = (globalInvoker != null)
+                                              ? globalInvoker
+                                              : new ThreadPoolExecutor(numWorkersPerSelector, numWorkersPerSelector,
+                                                                       0L, TimeUnit.MILLISECONDS,
+                                                                       new LinkedBlockingQueue<Runnable>());
+
+                selectorThreads[i] = new SelectorThread("Thrift-Selector_" + i,
+                                                        nextPowerOfTwo(ringSize),
+                                                        invoker,
+                                                        numHandlers == 0 ? 1 : numHandlers,
+                                                        (globalInvoker != null));
+            }
         }
         catch (IOException e)
         {
@@ -258,6 +299,9 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
     {
         for (SelectorThread selector : selectorThreads)
             selector.shutdown();
+
+        if (globalInvoker != null)
+            globalInvoker.shutdown();
     }
 
     @Override
@@ -315,7 +359,7 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
      */
     protected abstract void beforeInvoke(Message message);
 
-    protected abstract class AbstractSelectorThread extends Thread
+    protected abstract class AbstractSelectorThread extends Thread implements Closeable
     {
         protected final Selector selector = SelectorProvider.provider().openSelector();
 
@@ -337,8 +381,10 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             {
                 while (!isStopped())
                     select();
+                
+                for (SelectionKey key: selector.keys())
+                    cleanupSelectionKey(key);
 
-                selector.close();
             }
             catch (Throwable t)
             {
@@ -347,6 +393,8 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             finally
             {
                 isStopped = true;
+
+                close();
             }
         }
 
@@ -408,7 +456,10 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             Message message = (Message) key.attachment();
 
             if (message != null)
+            {
+                beforeClose(message);
                 message.close();
+            }
 
             // cancel the selection key
             key.cancel();
@@ -417,6 +468,18 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
         public void wakeupSelector()
         {
             selector.wakeup();
+        }
+
+        public void close()
+        {
+            try
+            {
+                selector.close();
+            }
+            catch (IOException e)
+            {
+                logger.warn("Failed to close selector: {}.", getName(), e);
+            }
         }
     }
 
@@ -461,6 +524,9 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
 
     protected class SelectorThread extends AbstractSelectorThread
     {
+        private final ThreadPoolExecutor invoker;
+        private final boolean isSharedInvoker;
+
         private final RingBuffer<Message.Invocation> ringBuffer;
         private final WorkerPool<Message.Invocation> workerPool;
         private final ConcurrentLinkedQueue<TNonblockingTransport> newConnections;
@@ -468,16 +534,19 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
         /**
          * Set up the thread that will handle the non-blocking reads, and writes.
          */
-        public SelectorThread(String name, int ringSize, int numWorkers) throws IOException
+        public SelectorThread(String name, int ringSize, ThreadPoolExecutor invoker, int numHandlers, boolean isSharedInvoker) throws IOException
         {
             super(name);
 
             this.newConnections = new ConcurrentLinkedQueue<>();
 
-            InvocationHandler handlers[] = new InvocationHandler[numWorkers];
+            InvocationHandler handlers[] = new InvocationHandler[numHandlers];
 
             for (int i = 0; i < handlers.length; i++)
                 handlers[i] = new InvocationHandler();
+
+            this.invoker = invoker;
+            this.isSharedInvoker = isSharedInvoker;
 
             /**
              * YieldingWaitStrategy claims to be better compromise between throughput/latency and CPU usage comparing to
@@ -486,9 +555,7 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
              */
             ringBuffer = RingBuffer.createSingleProducer(Message.Invocation.FACTORY, ringSize, new BlockingWaitStrategy());
             workerPool = new WorkerPool<>(ringBuffer, ringBuffer.newBarrier(), new FatalExceptionHandler(), handlers);
-            workerPool.start((numWorkers == 1)
-                              ? Executors.newSingleThreadExecutor()
-                              : Executors.newFixedThreadPool(numWorkers));
+            workerPool.start(invoker);
         }
 
         @Override
@@ -510,7 +577,7 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
             while ((newClient = newConnections.poll()) != null)
             {
                 SelectionKey clientKey = newClient.registerSelector(selector, SelectionKey.OP_READ);
-                clientKey.attach(new Message(newClient, clientKey, thriftFactories, useHeapBasedAllocation));
+                clientKey.attach(new Message(newClient, clientKey, thriftFactories, useHeapBasedAllocation, alwaysReallocateBuffers));
             }
         }
 
@@ -564,6 +631,9 @@ public abstract class TDisruptorServer extends TNonblockingServer implements TDi
         public void shutdown()
         {
             workerPool.drainAndHalt();
+
+            if (!isSharedInvoker)
+                invoker.shutdown();
         }
 
         public int getRingBufferSize()
